@@ -1,0 +1,257 @@
+---
+title: "NYC Crash Data Cleaning"
+author: "Aansh Jha"
+format:
+  pdf:
+    keep-tex: false
+    pdf-engine: tectonic
+jupyter: python3
+execute:
+  warning: false
+code-overflow: wrap
+---
+
+```{python}
+#| label: setup
+from pathlib import Path
+import json
+
+import numpy as np
+import pandas as pd
+from matplotlib.path import Path as PolygonPath
+
+DATA_DIR = Path("data")
+CRASH_FILE = DATA_DIR / "nyc_crashes_2024-06-30_to_2024-07-06.csv"
+```
+
+# 1. Load the crash data
+
+The file contains the seven-day period from June 30 through July 6, 2024. Dates are parsed at load time, crash times are retained as strings, and ZIP codes are loaded as strings so leading zeroes cannot be lost.
+
+```{python}
+df = pd.read_csv(
+    CRASH_FILE,
+    parse_dates=["crash_date"],
+    dtype={"crash_time": "string", "zip_code": "string"},
+)
+
+print(f"Rows: {len(df):,}")
+print(f"Date range: {df['crash_date'].min().date()} to {df['crash_date'].max().date()}")
+df[["crash_date", "crash_time", "borough", "zip_code", "latitude", "longitude"]].head()
+```
+
+# 2. Clean the variable names
+
+```{python}
+df.columns = (
+    df.columns.str.strip()
+    .str.lower()
+    .str.replace(r"[^a-z0-9]+", "_", regex=True)
+    .str.replace(r"(?<=code)(\d)$", r"_\1", regex=True)
+    .str.strip("_")
+)
+
+print("\n".join(df.columns))
+```
+
+# 3. Summarize the variables
+
+```{python}
+missing_summary = (
+    df.isna().mean().mul(100).rename("missing_percent").round(2).to_frame()
+)
+display(missing_summary)
+
+numeric_summary = (
+    df.select_dtypes(include="number")
+    .describe()
+    .T.loc[:, ["count", "min", "50%", "max"]]
+    .rename(columns={"count": "n", "50%": "median"})
+    .round(2)
+)
+display(numeric_summary)
+
+for column in df.select_dtypes(include=["object", "string", "category"]):
+    counts = df[column].value_counts(dropna=False)
+    print(f"\n{column}: {len(counts):,} distinct values; 10 most frequent")
+    print(counts.head(10).to_string())
+```
+
+# 4. Validate longitude and latitude
+
+Coordinates are invalid for this analysis when either value is missing or falls outside a conservative New York City bounding box. This correctly catches `(0, 0)`, which is globally valid but not in New York City.
+
+```{python}
+valid_geocode = (
+    df["latitude"].between(40.45, 40.95)
+    & df["longitude"].between(-74.30, -73.65)
+)
+invalid_geocode_count = int((~valid_geocode).sum())
+
+df.loc[~valid_geocode, ["latitude", "longitude", "location"]] = np.nan
+print(f"Invalid or missing coordinate pairs replaced with NA: {invalid_geocode_count}")
+```
+
+# 5. Validate NYC ZIP codes
+
+The valid-code list comes from NYC DOHMH's Modified ZIP Code Tabulation Areas dataset. It is safer than accepting every integer in a broad range.
+
+```{python}
+zip_reference = pd.read_csv(DATA_DIR / "nyc_modified_zip_codes.csv", dtype="string")
+valid_zip_codes = {
+    code.strip()
+    for values in zip_reference["label"].dropna()
+    for code in values.split(",")
+}
+
+df["zip_code"] = df["zip_code"].str.extract(r"(\d{5})", expand=False)
+invalid_zip = df["zip_code"].notna() & ~df["zip_code"].isin(valid_zip_codes)
+df.loc[invalid_zip, "zip_code"] = pd.NA
+
+print(f"Non-NYC ZIP codes replaced with NA: {int(invalid_zip.sum())}")
+```
+
+# 6. Compare missing ZIP code and borough values
+
+```{python}
+missing_zip = df["zip_code"].isna()
+missing_borough = df["borough"].isna()
+
+missing_comparison = pd.crosstab(
+    missing_zip,
+    missing_borough,
+    rownames=["ZIP code missing"],
+    colnames=["Borough missing"],
+)
+display(missing_comparison)
+print(f"Missingness always co-occurs: {bool((missing_zip == missing_borough).all())}")
+```
+
+# 7. Fill ZIP code and borough from valid coordinates
+
+The included NYC boundary files make the reverse lookup reproducible and avoid copying latitude into ZIP code or longitude into borough.
+
+```{python}
+def compile_boundaries(geojson_path, property_name):
+    with open(geojson_path, encoding="utf-8") as handle:
+        features = json.load(handle)["features"]
+
+    compiled = []
+    for feature in features:
+        geometry = feature["geometry"]
+        if geometry is None:
+            continue
+        polygons = (
+            [geometry["coordinates"]]
+            if geometry["type"] == "Polygon"
+            else geometry["coordinates"]
+        )
+        for rings in polygons:
+            exterior = PolygonPath(np.asarray(rings[0]))
+            holes = [PolygonPath(np.asarray(ring)) for ring in rings[1:]]
+            compiled.append((feature["properties"][property_name], exterior, holes))
+    return compiled
+
+
+def lookup_boundary(longitude, latitude, boundaries):
+    point = (longitude, latitude)
+    for value, exterior, holes in boundaries:
+        if exterior.contains_point(point) and not any(
+            hole.contains_point(point) for hole in holes
+        ):
+            return value
+    return None
+
+
+borough_boundaries = compile_boundaries(
+    DATA_DIR / "nyc_borough_boundaries.geojson", "boroname"
+)
+zip_boundaries = compile_boundaries(
+    DATA_DIR / "nyc_modified_zip_boundaries.geojson", "modzcta"
+)
+
+fillable = (
+    (df["zip_code"].isna() | df["borough"].isna())
+    & df["latitude"].notna()
+    & df["longitude"].notna()
+)
+
+for index, row in df.loc[fillable].iterrows():
+    if pd.isna(row["zip_code"]):
+        df.at[index, "zip_code"] = lookup_boundary(
+            row["longitude"], row["latitude"], zip_boundaries
+        )
+    if pd.isna(row["borough"]):
+        borough = lookup_boundary(
+            row["longitude"], row["latitude"], borough_boundaries
+        )
+        df.at[index, "borough"] = borough.upper() if borough else pd.NA
+
+print(f"Rows eligible for geographic filling: {int(fillable.sum())}")
+print(f"ZIP codes still missing: {int(df['zip_code'].isna().sum())}")
+print(f"Boroughs still missing: {int(df['borough'].isna().sum())}")
+```
+
+# 8. Is `location` redundant?
+
+`location` is a serialized pair derived from latitude and longitude. For analysis it is redundant, although an API may retain it for convenience and compatibility. Latitude and longitude should remain the authoritative numeric fields.
+
+# 9. Crash frequency by hour
+
+```{python}
+crash_time = pd.to_datetime(df["crash_time"], format="%H:%M", errors="coerce")
+df["crash_hour"] = crash_time.dt.hour
+hourly_frequency = df["crash_hour"].value_counts().sort_index()
+display(hourly_frequency.rename("crashes").to_frame())
+
+exact_midnight = int(df["crash_time"].eq("0:00").sum())
+print(f"Crashes recorded at exactly 00:00: {exact_midnight}")
+```
+
+An exact-midnight spike should not automatically be interpreted as bad luck or increased risk. `00:00` can also be used when the precise time is unknown or rounded, so the pattern warrants a data-quality question before a causal claim.
+
+# 10. Reconcile injury and fatality totals
+
+```{python}
+injury_components = [
+    "number_of_pedestrians_injured",
+    "number_of_cyclist_injured",
+    "number_of_motorist_injured",
+]
+fatality_components = [
+    "number_of_pedestrians_killed",
+    "number_of_cyclist_killed",
+    "number_of_motorist_killed",
+]
+
+df["calculated_injured_total"] = df[injury_components].sum(axis=1)
+df["calculated_killed_total"] = df[fatality_components].sum(axis=1)
+
+injury_mismatches = int(
+    df["number_of_persons_injured"].ne(df["calculated_injured_total"]).sum()
+)
+fatality_mismatches = int(
+    df["number_of_persons_killed"].ne(df["calculated_killed_total"]).sum()
+)
+print(f"Injury-total mismatches: {injury_mismatches}")
+print(f"Fatality-total mismatches: {fatality_mismatches}")
+```
+
+The totals should not be removed merely because they are derivable: keeping them supports auditing, but the provider should document and resolve any discrepancies.
+
+# 11. Standardize the primary contributing factor
+
+```{python}
+initial_factors = df["contributing_factor_vehicle_1"].value_counts(dropna=False)
+display(initial_factors.rename("count").to_frame())
+
+df["contributing_factor_vehicle_1"] = (
+    df["contributing_factor_vehicle_1"].str.strip().str.upper()
+)
+standardized_factors = df["contributing_factor_vehicle_1"].value_counts(dropna=False)
+display(standardized_factors.rename("count").to_frame())
+```
+
+# 12. Recommendations to the data provider
+
+The provider should validate NYC coordinate bounds, publish a code list for ZIP and categorical fields, distinguish unknown times from true midnight, and document how injury totals are reconciled with pedestrian, cyclist, and motorist subtotals. Stable validation rules would make revisions easier to audit.
